@@ -27,7 +27,9 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #if defined(CONFIG_X86_64)
-#include <linux/smp.h>
+#include <linux/semaphore.h>
+#include <asm/desc.h>
+#include <asm/acrnhyper.h>
 #endif
 #include "optee_private.h"
 #include "optee_smc.h"
@@ -38,7 +40,20 @@
 #define OPTEE_SHM_NUM_PRIV_PAGES	CONFIG_OPTEE_SHM_NUM_PRIV_PAGES
 
 #if defined(CONFIG_X86_64)
-#define OPTEE_VMCALL_SMC       0x6F707400
+//hypercall id for ACRN
+#define _HC_ID(x,y)             (((x)<<24)|(y))
+#define HC_ID_TEE_BASE          0x90UL
+#define HC_ID                   0x80UL
+#define HC_REE_REQUEST_SERVICE  _HC_ID(HC_ID,HC_ID_TEE_BASE+0x01)
+
+//shared memory address for parameters passing
+#define OPTEE_PARAMETERS_SHM_ADDR   0xFFE00000
+
+//shared memory semaphore used in SMC process
+static DEFINE_SEMAPHORE(optee_shm_lock);
+
+//SMC wait queue, waiting for interrupt of indicating TEE service status
+static DECLARE_WAIT_QUEUE_HEAD(optee_smc_queue);
 #endif
 
 /**
@@ -518,20 +533,29 @@ err_memunmap:
 }
 
 #if defined(CONFIG_X86_64)
+
 struct optee_smc_interface {
-    unsigned long args[5];
+	uint64_t a0;
+	uint64_t a1;
+	uint64_t a2;
+	uint64_t a3;
+	uint64_t a4;
+	uint64_t a5;
+	uint64_t a6;
+	uint64_t a7;
 };
 
-static void optee_smc(void *args)
+static struct optee_smc_interface *g_smc_interface = NULL;
+
+static unsigned long optee_hypercall(void)
 {
-    struct optee_smc_interface *p_args = args;
-    __asm__ __volatile__(
- 	"vmcall;"
- 	: "=D"(p_args->args[0]), "=S"(p_args->args[1]),
-	"=d"(p_args->args[2]), "=b"(p_args->args[3])
- 	: "a"(OPTEE_VMCALL_SMC), "D"(p_args->args[0]), "S"(p_args->args[1]),
-	"d"(p_args->args[2]), "b"(p_args->args[3]), "c"(p_args->args[4])
-    );
+    register unsigned long  result asm("rax");    
+    register unsigned long  r8 asm("r8")  = HC_REE_REQUEST_SERVICE;
+
+    __asm__ __volatile__("vmcall;": "=r"(result) : "r"(r8));
+
+    return result;
+    
 }
 
 /* Simple wrapper functions to be able to use a function pointer */
@@ -541,25 +565,64 @@ static void optee_smccc_smc(unsigned long a0, unsigned long a1,
 			    unsigned long a6, unsigned long a7,
 			    struct arm_smccc_res *res)
 {
-	int ret = 0;
-	struct optee_smc_interface s;
+    unsigned long result;
 
-	s.args[0] = a0;
-	s.args[1] = a1;
-	s.args[2] = a2;
-	s.args[3] = a3;
-	s.args[4] = a5 << 32 | a4;
+    //get lock for shard memory
+    if (down_interruptible(&optee_shm_lock)) {
+        pr_info("optee_smccc_smc not get lock\n");
+        return;
+    }
 
-	ret = smp_call_function_single(0, optee_smc, (void *)&s, 1);
-	if (ret) {
-		pr_err("%s: smp_call_function_single failed: %d\n", __func__, ret);
-	}
+    if (g_smc_interface == NULL) {
+        pr_info("g_smc_interface is null\n");
+        return;
+    }
 
-	res->a0 = s.args[0];
-	res->a1 = s.args[1];
-	res->a2 = s.args[2];
-	res->a3 = s.args[3];
+    g_smc_interface->a0 = a0;
+    g_smc_interface->a1 = a1;
+    g_smc_interface->a2 = a2;
+    g_smc_interface->a3 = a3;
+    g_smc_interface->a4 = a4;
+    g_smc_interface->a5 = a5;
+    g_smc_interface->a6 = 0x0; //a6 is used to indicate TEE work done or not
+    g_smc_interface->a7 = a7;
+
+    result = optee_hypercall();
+
+    if (result == 0) {
+        //pr_info("optee_smccc_smc tee return idle 0x%lx\n", a0);
+        //sleep and wait for interrupt
+        while (g_smc_interface->a6 != 0xa5a5a5a5) {
+            //pr_info("optee_smccc_smc start wait 0x%llx\n", g_smc_interface->a0);
+            wait_event_interruptible(optee_smc_queue, (g_smc_interface->a6 == 0xa5a5a5a5));
+        }
+
+        res->a0 = g_smc_interface->a0;
+        res->a1 = g_smc_interface->a1;
+        res->a2 = g_smc_interface->a2;
+        res->a3 = g_smc_interface->a3;
+
+        /*pr_info("optee_smccc_smc return with results: 0x%llx/0x%llx/0x%llx/0x%llx/0x%llx\n",
+                g_smc_interface->a0, g_smc_interface->a1,
+                g_smc_interface->a2, g_smc_interface->a3,
+                g_smc_interface->a6);*/
+    } else if (result == 1) {
+        //TEE is busy, retry it later
+        res->a0 = OPTEE_SMC_RETURN_ETHREAD_LIMIT;
+        pr_info("optee_smccc_smc tee return busy\n");
+    } else {
+        pr_info("optee_smccc_smc tee return other status %d\n", result);
+    }
+
+    up(&optee_shm_lock);
 }
+
+static void optee_interrupt_handler(void)
+{
+    g_smc_interface->a6 = 0xa5a5a5a5;
+    wake_up_interruptible(&optee_smc_queue);
+}
+
 #else
 /* Simple wrapper functions to be able to use a function pointer */
 static void optee_smccc_smc(unsigned long a0, unsigned long a1,
@@ -616,12 +679,24 @@ static struct optee *optee_probe(struct device_node *np)
 	int rc;
 
 #if defined(CONFIG_X86_64)
-	invoke_fn = optee_smccc_smc;
+    pr_info("probe start\n");
+    void *va = memremap(OPTEE_PARAMETERS_SHM_ADDR, PAGE_SIZE, MEMREMAP_WB);
+    if (!va) {
+        pr_err("shared memory for parameters ioremap failed\n");
+        return ERR_PTR(-EINVAL);
+    }
+	g_smc_interface = (struct optee_smc_interface *)va;
+
+    acrn_setup_intr_irq(optee_interrupt_handler);
+
+    invoke_fn = optee_smccc_smc;
 #else
 	invoke_fn = get_invoke_func(np);
 #endif
 	if (IS_ERR(invoke_fn))
 		return (void *)invoke_fn;
+
+    pr_info("api uid start at 0x%llx\n", (uint64_t)va);
 
 	if (!optee_msg_api_uid_is_optee_api(invoke_fn)) {
 		pr_warn("api uid mismatch\n");
