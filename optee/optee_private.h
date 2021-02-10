@@ -34,7 +34,7 @@
 typedef void (optee_invoke_fn)(unsigned long, unsigned long, unsigned long,
 				unsigned long, unsigned long, unsigned long,
 				unsigned long, unsigned long,
-				struct arm_smccc_res *);
+				struct arm_smccc_res *, unsigned long *slot);
 
 struct optee_call_queue {
 	/* Serializes access to this struct */

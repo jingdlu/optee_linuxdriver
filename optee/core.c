@@ -44,16 +44,31 @@
 #define _HC_ID(x,y)             (((x)<<24)|(y))
 #define HC_ID_TEE_BASE          0x90UL
 #define HC_ID                   0x80UL
-#define HC_REE_REQUEST_SERVICE  _HC_ID(HC_ID,HC_ID_TEE_BASE+0x01)
+#define HC_NOTIFY_TEE           _HC_ID(HC_ID,HC_ID_TEE_BASE+0x01)
 
 //shared memory address for parameters passing
 #define OPTEE_PARAMETERS_SHM_ADDR   0xFFE00000
 
-//shared memory semaphore used in SMC process
-static DEFINE_SEMAPHORE(optee_shm_lock);
+//shared memory slot max number for parameter passing
+#define OPTEE_SHM_SLOT_MAX 4
+
+//SMC handling status on OP-TEE side
+#define OPTEE_SMC_INITIALIZED   0x0
+#define OPTEE_SMC_HANDLING      0x5a5a5a5a
+#define OPTEE_SMC_DONE          0xa5a5a5a5
+
 
 //SMC wait queue, waiting for interrupt of indicating TEE service status
-static DECLARE_WAIT_QUEUE_HEAD(optee_smc_queue);
+static DECLARE_WAIT_QUEUE_HEAD(optee_smc_wait_queue);
+
+//shared memory slot wait queue, waiting for available shared memory slot
+static DECLARE_WAIT_QUEUE_HEAD(optee_shm_wait_queue);
+
+//spinlock used to protect shared memory slots bitmap operations
+static DEFINE_SPINLOCK(shm_bitmap_lock);
+
+//semaphore used to protect shared memory slots bitmap operations
+static DEFINE_SEMAPHORE(optee_bitmap_sem);
 #endif
 
 /**
@@ -369,8 +384,9 @@ static const struct tee_desc optee_supp_desc = {
 static bool optee_msg_api_uid_is_optee_api(optee_invoke_fn *invoke_fn)
 {
 	struct arm_smccc_res res;
+    unsigned long slot_idx = 0xFF;
 
-	invoke_fn(OPTEE_SMC_CALLS_UID, 0, 0, 0, 0, 0, 0, 0, &res);
+	invoke_fn(OPTEE_SMC_CALLS_UID, 0, 0, 0, 0, 0, 0, 0, &res, &slot_idx);
 
 	if (res.a0 == OPTEE_MSG_UID_0 && res.a1 == OPTEE_MSG_UID_1 &&
 	    res.a2 == OPTEE_MSG_UID_2 && res.a3 == OPTEE_MSG_UID_3)
@@ -380,6 +396,7 @@ static bool optee_msg_api_uid_is_optee_api(optee_invoke_fn *invoke_fn)
 
 static void optee_msg_get_os_revision(optee_invoke_fn *invoke_fn)
 {
+    unsigned long slot_idx = 0xFF;
 	union {
 		struct arm_smccc_res smccc;
 		struct optee_smc_call_get_os_revision_result result;
@@ -390,7 +407,7 @@ static void optee_msg_get_os_revision(optee_invoke_fn *invoke_fn)
 	};
 
 	invoke_fn(OPTEE_SMC_CALL_GET_OS_REVISION, 0, 0, 0, 0, 0, 0, 0,
-		  &res.smccc);
+		  &res.smccc, &slot_idx);
 
 	if (res.result.build_id)
 		pr_info("revision %lu.%lu (%08lx)", res.result.major,
@@ -401,12 +418,13 @@ static void optee_msg_get_os_revision(optee_invoke_fn *invoke_fn)
 
 static bool optee_msg_api_revision_is_compatible(optee_invoke_fn *invoke_fn)
 {
+    unsigned long slot_idx = 0xFF;
 	union {
 		struct arm_smccc_res smccc;
 		struct optee_smc_calls_revision_result result;
 	} res;
 
-	invoke_fn(OPTEE_SMC_CALLS_REVISION, 0, 0, 0, 0, 0, 0, 0, &res.smccc);
+	invoke_fn(OPTEE_SMC_CALLS_REVISION, 0, 0, 0, 0, 0, 0, 0, &res.smccc, &slot_idx);
 
 	if (res.result.major == OPTEE_MSG_REVISION_MAJOR &&
 	    (int)res.result.minor >= OPTEE_MSG_REVISION_MINOR)
@@ -417,6 +435,7 @@ static bool optee_msg_api_revision_is_compatible(optee_invoke_fn *invoke_fn)
 static bool optee_msg_exchange_capabilities(optee_invoke_fn *invoke_fn,
 					    u32 *sec_caps)
 {
+    unsigned long slot_idx = 0xFF;
 	union {
 		struct arm_smccc_res smccc;
 		struct optee_smc_exchange_capabilities_result result;
@@ -432,7 +451,7 @@ static bool optee_msg_exchange_capabilities(optee_invoke_fn *invoke_fn,
 		a1 |= OPTEE_SMC_NSEC_CAP_UNIPROCESSOR;
 
 	invoke_fn(OPTEE_SMC_EXCHANGE_CAPABILITIES, a1, 0, 0, 0, 0, 0, 0,
-		  &res.smccc);
+		  &res.smccc, &slot_idx);
 
 	if (res.result.status != OPTEE_SMC_RETURN_OK)
 		return false;
@@ -457,9 +476,10 @@ optee_config_shm_memremap(optee_invoke_fn *invoke_fn, void **memremaped_shm,
 	void *va;
 	struct tee_shm_pool_mgr *priv_mgr;
 	struct tee_shm_pool_mgr *dmabuf_mgr;
+    unsigned long slot_idx = 0xFF;
 	void *rc;
 
-	invoke_fn(OPTEE_SMC_GET_SHM_CONFIG, 0, 0, 0, 0, 0, 0, 0, &res.smccc);
+	invoke_fn(OPTEE_SMC_GET_SHM_CONFIG, 0, 0, 0, 0, 0, 0, 0, &res.smccc, &slot_idx);
 	if (res.result.status != OPTEE_SMC_RETURN_OK) {
 		pr_info("shm service not available\n");
 		return ERR_PTR(-ENOENT);
@@ -534,7 +554,7 @@ err_memunmap:
 
 #if defined(CONFIG_X86_64)
 
-struct optee_smc_interface {
+struct optee_smc_args {
 	uint64_t a0;
 	uint64_t a1;
 	uint64_t a2;
@@ -545,17 +565,22 @@ struct optee_smc_interface {
 	uint64_t a7;
 };
 
-static struct optee_smc_interface *g_smc_interface = NULL;
+struct optee_shm_slots {
+    struct optee_smc_args smc_args[OPTEE_SHM_SLOT_MAX];
+    DECLARE_BITMAP(shm_avail_bitmap, OPTEE_SHM_SLOT_MAX);
+};
 
-static unsigned long optee_hypercall(void)
+static struct optee_shm_slots *g_shm_slots = NULL;
+static struct optee_smc_args *g_smc_args = NULL;
+static unsigned long shm_slots_num = 0;
+static volatile int shm_slots_avail = 1;
+
+static void optee_hypercall(unsigned long index)
 {
-    register unsigned long  result asm("rax");    
-    register unsigned long  r8 asm("r8")  = HC_REE_REQUEST_SERVICE;
+    register unsigned long  r8 asm("r8")  = HC_NOTIFY_TEE;
 
-    __asm__ __volatile__("vmcall;": "=r"(result) : "r"(r8));
+    __asm__ __volatile__("vmcall;": : "D"(index), "r"(r8));
 
-    return result;
-    
 }
 
 /* Simple wrapper functions to be able to use a function pointer */
@@ -563,64 +588,85 @@ static void optee_smccc_smc(unsigned long a0, unsigned long a1,
 			    unsigned long a2, unsigned long a3,
 			    unsigned long a4, unsigned long a5,
 			    unsigned long a6, unsigned long a7,
-			    struct arm_smccc_res *res)
+			    struct arm_smccc_res *res, unsigned long *slot)
 {
-    unsigned long result;
+    unsigned long idx = 0;
+    int rv = 0;
 
-    //get lock for shard memory
-    if (down_interruptible(&optee_shm_lock)) {
-        pr_info("optee_smccc_smc not get lock\n");
-        return;
-    }
-
-    if (g_smc_interface == NULL) {
-        pr_info("g_smc_interface is null\n");
-        return;
-    }
-
-    g_smc_interface->a0 = a0;
-    g_smc_interface->a1 = a1;
-    g_smc_interface->a2 = a2;
-    g_smc_interface->a3 = a3;
-    g_smc_interface->a4 = a4;
-    g_smc_interface->a5 = a5;
-    g_smc_interface->a6 = 0x0; //a6 is used to indicate TEE work done or not
-    g_smc_interface->a7 = a7;
-
-    result = optee_hypercall();
-
-    if (result == 0) {
-        //pr_info("optee_smccc_smc tee return idle 0x%lx\n", a0);
-        //sleep and wait for interrupt
-        while (g_smc_interface->a6 != 0xa5a5a5a5) {
-            //pr_info("optee_smccc_smc start wait 0x%llx\n", g_smc_interface->a0);
-            wait_event_interruptible(optee_smc_queue, (g_smc_interface->a6 == 0xa5a5a5a5));
+    if (*slot < shm_slots_num) {
+        idx = *slot;
+    } else {
+        //Search first zero bit in avail. If found, set bit to 1. If not found, return busy.
+        if (down_interruptible(&optee_bitmap_sem)) {
+            pr_info("optee_smccc_smc not get lock\n");
+            return;
         }
 
-        res->a0 = g_smc_interface->a0;
-        res->a1 = g_smc_interface->a1;
-        res->a2 = g_smc_interface->a2;
-        res->a3 = g_smc_interface->a3;
+        spin_lock(&shm_bitmap_lock);
+        idx = find_first_zero_bit(g_shm_slots->shm_avail_bitmap, shm_slots_num);
+        while (idx >= shm_slots_num) {
+            shm_slots_avail = 0;
+            spin_unlock(&shm_bitmap_lock);
+            wait_event_interruptible(optee_shm_wait_queue, shm_slots_avail);
+            spin_lock(&shm_bitmap_lock);
+            idx = find_first_zero_bit(g_shm_slots->shm_avail_bitmap, shm_slots_num);
+        }
+        set_bit(idx, g_shm_slots->shm_avail_bitmap);
+        spin_unlock(&shm_bitmap_lock);
 
-        /*pr_info("optee_smccc_smc return with results: 0x%llx/0x%llx/0x%llx/0x%llx/0x%llx\n",
-                g_smc_interface->a0, g_smc_interface->a1,
-                g_smc_interface->a2, g_smc_interface->a3,
-                g_smc_interface->a6);*/
-    } else if (result == 1) {
-        //TEE is busy, retry it later
-        res->a0 = OPTEE_SMC_RETURN_ETHREAD_LIMIT;
-        pr_info("optee_smccc_smc tee return busy\n");
-    } else {
-        pr_info("optee_smccc_smc tee return other status %d\n", result);
+        up(&optee_bitmap_sem);
     }
 
-    up(&optee_shm_lock);
+    //Fill parameters to shared memeory slot
+    g_smc_args[idx].a0 = a0;
+    g_smc_args[idx].a1 = a1;
+    g_smc_args[idx].a2 = a2;
+    g_smc_args[idx].a3 = a3;
+    g_smc_args[idx].a4 = a4;
+    g_smc_args[idx].a5 = a5;
+    g_smc_args[idx].a6 = OPTEE_SMC_INITIALIZED; //a6 is used to indicate TEE work done or not
+    g_smc_args[idx].a7 = a7;
+
+    //Send hypercall and wait for interrupt
+    while (g_smc_args[idx].a6 != OPTEE_SMC_DONE) {
+        if (rv == 0) {
+            //Send hypercall first time or due to timeout
+            optee_hypercall(idx);
+        } else {
+            //Exception
+            pr_info("optee_smccc_smc break %ld:0x%llx\n", idx, g_smc_args[idx].a6);
+            break;
+        }
+
+        if (g_smc_args[idx].a6 == OPTEE_SMC_INITIALIZED) {
+            rv = wait_event_interruptible_timeout(optee_smc_wait_queue,
+                    (g_smc_args[idx].a6 == OPTEE_SMC_DONE), HZ/2);
+        } else if (g_smc_args[idx].a6 == OPTEE_SMC_HANDLING) {
+            rv = wait_event_interruptible(optee_smc_wait_queue,
+                    (g_smc_args[idx].a6 == OPTEE_SMC_DONE));
+        }
+    }
+
+    res->a0 = g_smc_args[idx].a0;
+    res->a1 = g_smc_args[idx].a1;
+    res->a2 = g_smc_args[idx].a2;
+    res->a3 = g_smc_args[idx].a3;
+
+    if (OPTEE_SMC_RETURN_IS_RPC(res->a0)) {
+        *slot = idx;
+    } else {
+        *slot = 0xFF;
+        spin_lock(&shm_bitmap_lock);
+        clear_bit(idx, g_shm_slots->shm_avail_bitmap);
+        shm_slots_avail = 1;
+        wake_up_interruptible(&optee_shm_wait_queue);
+        spin_unlock(&shm_bitmap_lock);
+    }
 }
 
 static void optee_interrupt_handler(void)
 {
-    g_smc_interface->a6 = 0xa5a5a5a5;
-    wake_up_interruptible(&optee_smc_queue);
+    wake_up_interruptible(&optee_smc_wait_queue);
 }
 
 #else
@@ -679,13 +725,21 @@ static struct optee *optee_probe(struct device_node *np)
 	int rc;
 
 #if defined(CONFIG_X86_64)
-    pr_info("probe start\n");
-    void *va = memremap(OPTEE_PARAMETERS_SHM_ADDR, PAGE_SIZE, MEMREMAP_WB);
-    if (!va) {
-        pr_err("shared memory for parameters ioremap failed\n");
+    g_shm_slots = (struct optee_shm_slots *)memremap(OPTEE_PARAMETERS_SHM_ADDR,
+            PAGE_SIZE, MEMREMAP_WB);
+    if (!g_shm_slots) {
+        pr_err("shared memory for parameters ioremap failed!\n");
         return ERR_PTR(-EINVAL);
     }
-	g_smc_interface = (struct optee_smc_interface *)va;
+    g_smc_args = g_shm_slots->smc_args;
+
+    shm_slots_num = g_smc_args[0].a0;
+    if (shm_slots_num > OPTEE_SHM_SLOT_MAX) {
+        pr_err("shared memory slots %ld not enough!\n", shm_slots_num);
+        return ERR_PTR(-EINVAL);
+    }
+
+    pr_info("slots num is %ld\n", shm_slots_num);
 
     acrn_setup_intr_irq(optee_interrupt_handler);
 
@@ -695,8 +749,6 @@ static struct optee *optee_probe(struct device_node *np)
 #endif
 	if (IS_ERR(invoke_fn))
 		return (void *)invoke_fn;
-
-    pr_info("api uid start at 0x%llx\n", (uint64_t)va);
 
 	if (!optee_msg_api_uid_is_optee_api(invoke_fn)) {
 		pr_warn("api uid mismatch\n");

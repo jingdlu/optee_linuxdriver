@@ -137,6 +137,7 @@ u32 optee_do_call_with_arg(struct tee_context *ctx, phys_addr_t parg)
 	struct optee_call_waiter w;
 	struct optee_rpc_param param = { };
 	struct optee_call_ctx call_ctx = { };
+    unsigned long slot_idx = 0xFF;
 	u32 ret;
 
 	param.a0 = OPTEE_SMC_CALL_WITH_ARG;
@@ -148,7 +149,7 @@ u32 optee_do_call_with_arg(struct tee_context *ctx, phys_addr_t parg)
 
 		optee->invoke_fn(param.a0, param.a1, param.a2, param.a3,
 				 param.a4, param.a5, param.a6, param.a7,
-				 &res);
+				 &res, &slot_idx);
 
 		if (res.a0 == OPTEE_SMC_RETURN_ETHREAD_LIMIT) {
 			/*
@@ -397,6 +398,7 @@ int optee_cancel_req(struct tee_context *ctx, u32 cancel_id, u32 session)
 void optee_enable_shm_cache(struct optee *optee)
 {
 	struct optee_call_waiter w;
+    unsigned long slot_idx = 0xFF;
 
 	/* We need to retry until secure world isn't busy. */
 	optee_cq_wait_init(&optee->call_queue, &w);
@@ -404,7 +406,7 @@ void optee_enable_shm_cache(struct optee *optee)
 		struct arm_smccc_res res;
 
 		optee->invoke_fn(OPTEE_SMC_ENABLE_SHM_CACHE, 0, 0, 0, 0, 0, 0,
-				 0, &res);
+				 0, &res, &slot_idx);
 		if (res.a0 == OPTEE_SMC_RETURN_OK)
 			break;
 		optee_cq_wait_for_completion(&optee->call_queue, &w);
@@ -420,6 +422,7 @@ void optee_enable_shm_cache(struct optee *optee)
 void optee_disable_shm_cache(struct optee *optee)
 {
 	struct optee_call_waiter w;
+    unsigned long slot_idx = 0xFF;
 
 	/* We need to retry until secure world isn't busy. */
 	optee_cq_wait_init(&optee->call_queue, &w);
@@ -430,7 +433,7 @@ void optee_disable_shm_cache(struct optee *optee)
 		} res;
 
 		optee->invoke_fn(OPTEE_SMC_DISABLE_SHM_CACHE, 0, 0, 0, 0, 0, 0,
-				 0, &res.smccc);
+				 0, &res.smccc, &slot_idx);
 		if (res.result.status == OPTEE_SMC_RETURN_ENOTAVAIL)
 			break; /* All shm's freed */
 		if (res.result.status == OPTEE_SMC_RETURN_OK) {
